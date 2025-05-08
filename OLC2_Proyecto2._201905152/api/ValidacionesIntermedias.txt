@@ -1,0 +1,23 @@
+// 1. Manejo de entornos (3 puntos)
+//MISMO ERROR DEL IF
+func main() {
+puntosEntornos := 0
+
+	fmt.Println("\nVariable redeclarada en un entorno diferente")
+	b := 10
+	if true {
+		// Esto es válido en Go porque crea una nueva variable b en un ámbito diferente
+		b := 20
+		fmt.Println("b dentro del if =", b)
+
+		if b == 20 {
+			puntosEntornos = puntosEntornos + 2
+			fmt.Println("OK Redeclaración en entorno diferente: correcto")
+		} else {
+			fmt.Println("X Redeclaración en entorno diferente: incorrecto")
+		}
+	}
+	
+}
+
+// 2. If / Else (3 puntos)

@@ -1,0 +1,29 @@
+func main() {
+    numeros := []int{1, 2, 3, 4, 5}
+    fmt.Println("numeros:", numeros)
+    fmt.Println("OK Creación con literales: correcto")
+
+    // 2. Acceso de Elementos (6 puntos)
+	fmt.Println("\n==== Acceso de Elementos ====")
+
+	fmt.Println("Acceso por índice:")
+	primerElemento := numeros[0]
+	fmt.Println("Primer elemento:", primerElemento)
+
+	fmt.Println("\nModificación de elementos:")
+	numeros[0] = 10
+	fmt.Println("numeros después de modificar:", numeros)
+
+    	// 3. Función slices.Index (1 punto)
+	fmt.Println("\n==== Función slices.Index ====")
+	puntosIndex := 0
+
+	fmt.Println("Búsqueda de elementos con slices.Index:")
+	numeros = []int{10, 20, 30, 40, 50}
+	indice1 := slices.Index(numeros, 30)
+	indice2 := slices.Index(numeros, 60) // No existe, debería retornar -1
+	fmt.Println("Índice de 30:", indice1)
+	fmt.Println("Índice de 60:", indice2)
+
+
+}

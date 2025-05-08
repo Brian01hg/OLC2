@@ -1,0 +1,1376 @@
+using System.Runtime.InteropServices;
+using System.Windows.Markup;
+using Antlr4.Runtime.Misc;
+using Antlr4.Runtime.Tree;
+using analyzer;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
+using System.Text.Json;
+using System.Text;
+using System.Collections.Generic;
+namespace api.Controllers;
+
+
+
+
+public class CompileVisitor : LanguageBaseVisitor<Object?>
+{
+
+    public armGenerator c = new armGenerator();
+
+    private string? continueLabel = null;
+
+    private string? breakLabel = null;
+
+    private string? returnLabel = null;
+
+    //private Dictionary<string, FunctionMetadata> functions = new Dictionary<string, FunctionMetadata>();
+
+    private string? insideFucntion = null;
+
+    private int framePointerOffset = 0; 
+
+
+
+    public CompileVisitor()
+    {
+
+    }
+
+    
+public override object? VisitProgram(LanguageParser.ProgramContext context)
+{
+    c.Comment("Inicio del programa");
+    c.Label("start");    // alias _start en el ensamblado
+    // aquí podrías necesitar: c.Label("_start"); según tu convención
+
+    // Genera primero todas las funcDcl y funcMain
+    foreach (var d in context.dcl())
+        Visit(d);
+
+    // Luego, invoca a main y sal
+    c.Comment("Llamar a main()");
+    c.Bl("main");        // llama a la etiqueta main
+    c.Comment("Salir del programa");
+    c.EndProgram();      // único syscall exit
+    return null;
+}
+
+
+public override object? VisitFuncDcl(LanguageParser.FuncDclContext context)
+{
+    var funcName = context.ID().GetText();
+    var funcLabel = $"func_{funcName}";
+    c.Comment($"--- Inicio de función {funcName} ---");
+    c.Label(funcLabel);
+
+    var prevReturnLabel = returnLabel;
+    returnLabel = c.GetLabel();
+
+    c.NewScope();
+
+    // Procesar el cuerpo de la función
+    foreach (var stmt in context.dcl())
+    {
+        Visit(stmt);
+    }
+
+    // Punto de retorno
+    c.SetLabel(returnLabel);
+    c.Comment($"--- Fin de función {funcName} ---");
+    c.Ret();
+
+    // Limpiar stack si se usó memoria local
+    var bytesToRemove = c.endScope();
+    if (bytesToRemove > 0)
+    {
+        c.Comment($"Liberando {bytesToRemove} bytes del stack");
+        c.Mov(Register.X0, bytesToRemove);
+        c.Add(Register.SP, Register.SP, Register.X0);
+    }
+
+    returnLabel = prevReturnLabel;
+    return null;
+}
+
+/*
+public override Object? VisitFuncDcl(LanguageParser.FuncDclContext context)
+{
+
+    int baseOffset = 2;
+    int paramsOffset= 0;
+
+    if (context.@params() != null)
+    {
+        paramsOffset = context.@params.param.Length;
+
+    }
+
+    FrameVisitor frameVisitor = new FrameVisitor(baseOffset + paramsOffset);
+
+    foreach (var dcl in context.dcl());
+    {
+        frameVisitor.Visit(dcl);
+
+    }
+
+    var frame = frameVisitor.Frame;
+    int localOffset = frame.Count;
+    inr returnOffset = 1;
+
+    int totalFrameSize = baseOffset + paramsOffset + localOffset + returnOffset;
+    string funcName = context.ID(0).GetText();
+    StackObject.StackObjectType funcType = GetType(context.ID(1).GetText());
+
+
+    functions.Add(funcName, new FunctionMetadata{
+        FrameSize = totalFrameSize,
+        ReturnType = funcType
+    });
+
+    var prevInstructions = c.instructions;
+    c.instructions = new List<string>();
+
+    var paramCounter = 0;
+
+    
+}
+*/
+
+
+
+
+public override object? VisitFuncMain(LanguageParser.FuncMainContext context)
+{
+    c.Comment("=== inicio función main ===");
+    c.Label("main");
+    c.NewScope();    // abre scope local
+
+    // cuerpo de main
+    foreach (var d in context.dcl())
+    {
+        Visit(d);
+    }
+
+    // epílogo igual que en VisitFuncDcl:
+    int bytesToRemove = c.endScope();
+    if (bytesToRemove > 0)
+    {
+        c.Comment($"Liberar {bytesToRemove} bytes del stack");
+        c.Mov(Register.X0, bytesToRemove);
+        c.Add(Register.SP, Register.SP, Register.X0);
+    }
+
+    c.Comment("=== fin función main ===");
+    c.Ret();        // solo RET, no syscall
+    return null;
+}
+
+
+
+
+public override Object? VisitRune(LanguageParser.RuneContext context)
+{
+    var value = context.GetText(); // 'A'
+    char rune = value.Trim('\'')[0]; // Extrae el caracter
+    c.Comment("Constant rune: " + rune);
+
+    var strObj = c.StringObject();
+    c.PushConstant(strObj, rune.ToString());
+    return null;
+}
+
+
+public override object? VisitVarDcl(LanguageParser.VarDclContext context)
+{
+    var varName = context.ID().GetText();
+    c.Comment("Variable declaration: " + varName);
+
+    StackObject obj;
+
+    if (context.Tipo() != null && context.expr() != null)
+    {
+        Visit(context.expr());
+        var value = c.PopObject(Register.X0);
+        obj = c.CloneObject(value);
+        obj.Id = varName;
+
+        if (obj.Type == StackObject.StackObjectType.String)
+        {
+            c.Push(Register.HP);
+        }
+        else if (obj.Type == StackObject.StackObjectType.Float)
+        {
+            c.Push(Register.D0);
+        }
+        else
+        {
+            c.Push(Register.X0);
+        }
+
+        c.PushObject(obj);
+        return null;
+    }
+
+    if (context.Tipo() != null && context.expr() == null)
+    {
+        var tipo = context.Tipo().GetText();
+        obj = tipo switch
+        {
+            "int" => c.IntObject(),
+            "float64" => c.FloatObject(),
+            "string" => c.StringObject(),
+            "bool" => c.BoolObject(),
+            "rune" => c.IntObject(),
+            _ => throw new Exception("Tipo desconocido")
+        };
+        obj.Id = varName;
+
+        c.Comment("Default value for type: " + tipo);
+
+        switch (tipo)
+        {
+            case "string":
+                c.Push(Register.HP);
+                break;
+            case "int":
+            case "bool":
+            case "rune":
+                c.Mov(Register.X0, 0);
+                c.Push(Register.X0);
+                break;
+            case "float64":
+                c.Mov("x0", 0);
+                c.Str("x0", Register.SP);
+                c.Push("x0");
+                break;
+        }
+
+        c.PushObject(obj);
+        return null;
+    }
+
+    if (context.expr() != null && context.Tipo() == null)
+    {
+        Visit(context.expr());
+        var value = c.PopObject(Register.X0);
+        obj = c.CloneObject(value);
+        obj.Id = varName;
+
+        if (obj.Type == StackObject.StackObjectType.String)
+        {
+            c.Push(Register.HP);
+        }
+        else if (obj.Type == StackObject.StackObjectType.Float)
+        {
+            c.Push(Register.D0);
+        }
+        else
+        {
+            c.Push(Register.X0);
+        }
+
+        c.PushObject(obj);
+        return null;
+    }
+
+    return null;
+}
+
+public override object? VisitPrintStmt(LanguageParser.PrintStmtContext context)
+{
+    var list = context.exprList();
+    if (list != null)
+    {
+        bool first = true;
+        foreach (var expr in list.expr())
+        {
+            if (!first)
+            {
+                var spaceObj = c.StringObject();
+                c.PushConstant(spaceObj, " ");
+                c.PopObject(Register.X0);
+                c.PrintString(Register.X0);
+            }
+            first = false;
+
+            Visit(expr);
+            var top = c.TopObject();
+
+            switch (top.Type)
+            {
+                case StackObject.StackObjectType.Int:
+                {
+                    c.PopObject(Register.X0);
+                    c.PrintInteger(Register.X0);
+                    break;
+                }
+
+                case StackObject.StackObjectType.Bool:
+                {
+                    c.PopObject(Register.X0);
+                    var lbTrue  = c.GetLabel();
+                    var lbEnd   = c.GetLabel();
+
+                    // Si inner != 0 (true), salta a lbTrue
+                    c.Cbnz(Register.X0, lbTrue);
+
+                    // false
+                    var sFalse = c.StringObject();
+                    c.PushConstant(sFalse, "false\n");
+                    c.PopObject(Register.X0);
+                    c.PrintString(Register.X0);
+                    c.B(lbEnd);
+
+                    // true
+                    c.SetLabel(lbTrue);
+                    var sTrue = c.StringObject();
+                    c.PushConstant(sTrue, "true\n");
+                    c.PopObject(Register.X0);
+                    c.PrintString(Register.X0);
+
+                    c.SetLabel(lbEnd);
+                    break;
+                }
+
+                case StackObject.StackObjectType.Float:
+                {
+                    c.PopObject(Register.D0);
+                    c.PrintFloat();
+                    break;
+                }
+
+                case StackObject.StackObjectType.String:
+                {
+                    c.PopObject(Register.X0);
+                    c.PrintString(Register.X0);
+                    break;
+                }
+
+                case StackObject.StackObjectType.Pointer:
+                {
+                    var slice = c.PopObject(Register.X0);
+                    int len = slice.Length;
+                    c.Mov("x11", Register.X0);
+
+                    // '['
+                    var lb = c.StringObject();
+                    c.PushConstant(lb, "[");
+                    c.PopObject(Register.X1);
+                    c.PrintString(Register.X1);
+
+                    for (int i = 0; i < len; i++)
+                    {
+                        if (i > 0)
+                        {
+                            var sp = c.StringObject();
+                            c.PushConstant(sp, " ");
+                            c.PopObject(Register.X2);
+                            c.PrintString(Register.X2);
+                        }
+                        c.Ldr(Register.X2, "x11");
+                        c.PrintInteger(Register.X2);
+                        c.Add("x11", "x11", 8);
+                    }
+
+                    var rb = c.StringObject();
+                    c.PushConstant(rb, "]");
+                    c.PopObject(Register.X1);
+                    c.PrintString(Register.X1);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Salto de línea al final
+    var newlineObj = c.StringObject();
+    c.PushConstant(newlineObj, "\n");
+    c.PopObject(Register.X0);
+    c.PrintString(Register.X0);
+    return null;
+}
+
+
+
+public override ValueWrapper VisitIdentifier(LanguageParser.IdentifierContext context)
+{
+    var varName = context.ID().GetText();
+    c.Comment("Reading variable: " + varName);
+
+    var (offset, varObject) = c.GetObject(varName);
+    c.Mov(Register.X1, offset);
+    c.Add(Register.X1, Register.SP, Register.X1);
+
+    if (varObject.Type == StackObject.StackObjectType.Float)
+    {
+        c.Fldr(Register.D0, Register.X1);
+        c.Push(Register.D0);
+    }
+    else
+    {
+        c.Ldr(Register.X0, Register.X1);
+        c.Push(Register.X0);
+    }
+
+    c.PushObject(c.CloneObject(varObject));
+    return null;
+}
+
+
+public override Object? VisitParens(LanguageParser.ParensContext context)
+{
+    return Visit(context.expr());
+}
+
+public override Object? VisitString(LanguageParser.StringContext context)
+{
+    var value = context.STRING().GetText().Trim('"');
+    c.Comment("Constant: \"" + value + "\"");
+    var stringObject = c.StringObject();
+    c.PushConstant(stringObject, value); // Push the string value
+    return null;
+}
+
+public override Object? VisitBoolean(LanguageParser.BooleanContext context)
+{
+    var value = context.BOOL().GetText();
+    c.Comment("Constant: " + value);
+
+    var boolObject = c.BoolObject();
+    c.PushConstant(boolObject, value == "true" ? true : false);
+    
+    return null;
+}
+
+
+
+public override Object? VisitNegate(LanguageParser.NegateContext context)
+{
+    return null;
+}
+
+public override object? VisitInt(LanguageParser.IntContext context)
+{
+    int value = int.Parse(context.GetText());
+    c.Mov(Register.X0, value);      // Coloca valor en X0
+    c.Push(Register.X0);            // Lo pone en el stack
+    c.PushObject(c.IntObject());    // Marca tipo int para Pop
+    return null;
+}
+
+
+public override Object? VisitNilExpr(LanguageParser.NilExprContext context)
+{
+    c.Comment("Valor nulo: nil");
+    c.Mov(Register.X0, 0);
+    c.Push(Register.X0);
+    c.PushObject(new StackObject
+    {
+        Type = StackObject.StackObjectType.Pointer,
+        Length = 8,
+        Depth = 0,
+        Id = null
+    });
+    return null;
+}
+
+public override ValueWrapper VisitAssign(LanguageParser.AssignContext context)
+{
+    var left  = context.expr(0);
+    var right = context.expr(1);
+
+    /*─────────────────────────────────────────────────────────
+      A.  slice[index] = expr   (escritura en slice)
+    ─────────────────────────────────────────────────────────*/
+    if (left is LanguageParser.CalleeContext calleeCtx &&
+        calleeCtx.call().Length == 1 &&
+        calleeCtx.call(0) is LanguageParser.ArrayAccessContext arrCtx)
+    {
+        /* RHS */
+        Visit(right);
+        var valObj = c.PopObject(Register.X3);        // X3 = nuevo valor
+
+        /* Slice e índice */
+        Visit(calleeCtx.expr());                      // slice
+        Visit(arrCtx.expr());                         // índice
+
+        var idxObj   = c.PopObject(Register.X1);      // idx en X1
+        var sliceObj = c.PopObject(Register.X0);      // base en X0
+
+        if (idxObj.Type  != StackObject.StackObjectType.Int ||
+            sliceObj.Type != StackObject.StackObjectType.Pointer)
+            throw new Exception("asignación de slice mal formada");
+
+        /* idx *= 8 */
+        c.Mov(Register.X2, 8);
+        c.Mul(Register.X1, Register.X1, Register.X2);
+
+        /* dst = base + idx*8 */
+        c.Add(Register.X0, Register.X0, Register.X1);
+
+        /* STR nuevo valor */
+        c.Str(Register.X3, Register.X0);
+
+        /* Opcional: deja valor en la pila */
+        c.Push(Register.X3);
+        c.PushObject(valObj);
+        return null;
+    }
+
+    /*─────────────────────────────────────────────────────────
+      B.  identificador = expr   (variable simple)
+    ─────────────────────────────────────────────────────────*/
+    if (left is LanguageParser.IdentifierContext idCtx)
+    {
+        string varName = idCtx.ID().GetText();
+
+        /* RHS */
+        Visit(right);
+        var valueObject = c.PopObject(Register.X0);   // X0 = valor
+
+        /* Localiza variable en la pila */
+        var (offset, varObject) = c.GetObject(varName);
+
+        /* Dirección destino en memoria */
+        c.Mov(Register.X1, offset);
+        c.Add(Register.X1, Register.SP, Register.X1);
+
+        /* Guarda según tipo */
+        switch (valueObject.Type)
+        {
+            case StackObject.StackObjectType.Float:
+                c.Fstr(Register.D0, Register.X1);
+                break;
+            default:
+                c.Str(Register.X0, Register.X1);
+                break;
+        }
+
+        // 🔒 Ya no actualizamos tipo ni longitud para no romper el entorno
+
+        /* Deja resultado actualizado en la pila */
+        
+        return null;
+    }
+
+    /* Si llegamos aquí: aún no soportado */
+    throw new Exception("Solo se permite asignación a variable o slice[index].");
+}
+
+
+public override Object? VisitAddSub(LanguageParser.AddSubContext context)
+{
+    c.Comment("Add/Substract operation");
+
+    var operation = context.op.Text;
+
+    // Evaluar ambos operandos
+    Visit(context.expr(0));
+    Visit(context.expr(1));
+
+    // Obtener tipos antes de hacer Pop
+    var rightIsFloat = c.TopObject().Type == StackObject.StackObjectType.Float;
+    var rightObj = c.PopObject(rightIsFloat ? Register.D0 : Register.X0);
+
+    var leftIsFloat = c.TopObject().Type == StackObject.StackObjectType.Float;
+    var leftObj = c.PopObject(leftIsFloat ? Register.D1 : Register.X1);
+
+    var leftType = leftObj.Type;
+    var rightType = rightObj.Type;
+
+    // 🎯 Concatenación de strings
+if (leftType == StackObject.StackObjectType.String && rightType == StackObject.StackObjectType.String)
+{
+    c.Pop(Register.X0); // right
+    c.Pop(Register.X1); // left
+
+    var loopCopyLeft = c.GetLabel();
+    var loopCopyRight = c.GetLabel();
+
+    // x10 es HP
+    c.Mov("x2", "x10"); // x2 = destino actual
+    c.Mov("x3", "x10"); // x3 = dirección inicial (esto se debe usar para guardar en la variable)
+
+    // Copiar izquierda
+    c.SetLabel(loopCopyLeft);
+    c.Ldrb("w4", "x1");
+    c.Strb("w4", "x2");
+    c.Add("x1", "x1", 1);
+    c.Add("x2", "x2", 1);
+    c.Cmp("w4", 0);
+    c.Bne(loopCopyLeft);
+
+    // Copiar derecha
+    c.SetLabel(loopCopyRight);
+    c.Ldrb("w4", "x0");
+    c.Strb("w4", "x2");
+    c.Add("x0", "x0", 1);
+    c.Add("x2", "x2", 1);
+    c.Cmp("w4", 0);
+    c.Bne(loopCopyRight);
+
+    // Finalmente: Push de x3 (inicio de string concatenado, no x10)
+    c.Push("x3");
+    c.PushObject(c.StringObject());
+
+    return null;
+}
+    // 🎯 Caso de suma/resta con float
+    if (leftType == StackObject.StackObjectType.Float || rightType == StackObject.StackObjectType.Float)
+    {
+        if (!leftIsFloat) c.Scvtf(Register.D1, Register.X1);
+        if (!rightIsFloat) c.Scvtf(Register.D0, Register.X0);
+
+        if (operation == "+")
+            c.Fadd(Register.D0, Register.D0, Register.D1);
+        else
+            c.Fsub(Register.D0, Register.D0, Register.D1);
+
+        c.Push(Register.D0);
+        c.PushObject(c.FloatObject());
+        return null;
+    }
+
+    // 🎯 Caso suma/resta de enteros
+    if (operation == "+")
+        c.Add(Register.X0, Register.X0, Register.X1);
+    else
+        c.Sub(Register.X0, Register.X0, Register.X1);
+
+    c.Push(Register.X0);
+    c.PushObject(c.IntObject());
+    return null;
+}
+
+
+public override object? VisitNot(LanguageParser.NotContext context)
+{
+    c.Comment("Logical NOT");
+
+    Visit(context.expr());
+    c.Pop("X0");
+    var obj = c.TopObject(); c.PopObject("X0");
+    if (obj.Type != StackObject.StackObjectType.Bool) throw new Exception("El operando de ! no es booleano");
+
+    var falseLabel = c.GetLabel();
+    var endLabel = c.GetLabel();
+
+    // Si inner != 0 (true), goto falseLabel
+    c.Cbnz("X0", falseLabel);
+    // inner==0 => !false => true
+    c.Mov("X0", 1);
+    c.B(endLabel);
+
+    // falseLabel: inner true => !true => false
+    c.SetLabel(falseLabel);
+    c.Mov("X0", 0);
+
+    c.SetLabel(endLabel);
+    c.Push("X0");
+    c.PushObject(c.BoolObject());
+    return null;
+}
+
+public override Object? VisitMulDiv(LanguageParser.MulDivContext context)
+{
+    c.Comment("Multiplicación/División");
+
+    var operation = context.op.Text;
+
+    Visit(context.expr(0));
+    Visit(context.expr(1));
+
+    var isRightDouble = c.TopObject().Type == StackObject.StackObjectType.Float;
+    var right = c.PopObject(isRightDouble ? Register.D0 : Register.X0);
+    var isLeftDouble = c.TopObject().Type == StackObject.StackObjectType.Float;
+    var left = c.PopObject(isLeftDouble ? Register.D1 : Register.X1);
+
+    if (isLeftDouble || isRightDouble)
+    {
+        if (!isLeftDouble) c.Scvtf(Register.D1, Register.X1);
+        if (!isRightDouble) c.Scvtf(Register.D0, Register.X0);
+
+        if (operation == "*")
+            c.Fmul("D0", "D0", "D1");
+        else
+            c.Fdiv("D0", "D0", "D1");
+
+        c.Push("D0");
+        c.PushObject(c.CloneObject(isLeftDouble ? left : right));
+        return null;
+    }
+
+    if (operation == "*")
+        c.Mul("X0", "X0", "X1");
+    else
+        c.Div("X0", "X0", "X1");
+
+    c.Push("X0");
+    c.PushObject(c.CloneObject(left));
+    return null;
+}
+
+
+
+
+public override Object? VisitWhileStmt(LanguageParser.WhileStmtContext context)
+{
+    c.Comment("While statement");
+    var startLabel = c.GetLabel();
+    var endLabel = c.GetLabel();
+
+    var prevContinueLabel = continueLabel;
+    var prevBreakLabel = breakLabel;
+    continueLabel = startLabel;
+    breakLabel = endLabel;
+
+
+    c.SetLabel(startLabel);
+    Visit(context.expr());
+    c.PopObject(Register.X0);
+    c.Cbz(Register.X0, endLabel);
+    Visit(context.stmt());
+    c.B(startLabel);
+    c.SetLabel(endLabel);
+
+    c.Comment("End of while statement");
+
+    continueLabel = prevContinueLabel;
+    breakLabel = prevBreakLabel;
+
+    return null;    
+    
+}
+
+
+
+public override Object? VisitIfStmt(LanguageParser.IfStmtContext context)
+{
+    c.Comment("If statement");
+    // 1) Generar y evaluar la condición
+    Visit(context.expr());
+    c.PopObject(Register.X0);
+
+    bool hasElse = context.stmt().Length > 1;
+    string elseLabel = c.GetLabel();
+    string endLabel  = c.GetLabel();
+
+    // 2) Si la condición es falsa, saltar a else (o fin si no hay else)
+    c.Cbz(Register.X0, hasElse ? elseLabel : endLabel);
+
+    // 3) Bloque "then"
+    Visit(context.stmt(0));
+    c.B(endLabel);
+
+    if (hasElse)
+    {
+        // 4) Bloque "else"
+        c.SetLabel(elseLabel);
+        Visit(context.stmt(1));
+    }
+
+    // 5) Punto final del if
+    c.SetLabel(endLabel);
+    return null;
+}
+
+
+
+
+public override Object? VisitFloat(LanguageParser.FloatContext context)
+{
+
+    var value = context.FLOAT().GetText();
+
+    c.Comment("Constant: " + value);
+    var FloatObject = c.FloatObject();
+    c.PushConstant(FloatObject, double.Parse(value));
+    return null;
+}
+
+
+
+
+public override Object? VisitBlockStmt(LanguageParser.BlockStmtContext context)
+{
+    c.Comment("Inicio de bloque {");
+    c.NewScope();
+
+    foreach (var dcl in context.dcl())
+    {
+        Visit(dcl);
+    }
+
+    int bytesToRemove = c.endScope();
+    
+    if (bytesToRemove > 0)
+    {
+        c.Comment("Removing" + bytesToRemove + "bytes from stack");
+        c.Mov(Register.X0, bytesToRemove);
+        c.Add(Register.SP, Register.SP, Register.X0);
+        c.Comment("Stack pointend adjusted");
+        
+    }
+    
+    return null;
+    
+}
+
+// For estilo “while”
+public override Object? VisitForStmtCond(LanguageParser.ForStmtCondContext context)
+{
+    c.Comment("Visiting For Statement Condition");
+
+    var startLabel = c.GetLabel();
+    var endLabel   = c.GetLabel();
+
+    // guarda los labels exteriores
+    var prevContinue = continueLabel;
+    var prevBreak    = breakLabel;
+    continueLabel = startLabel;
+    breakLabel    = endLabel;
+
+    // etiqueta de inicio
+    c.SetLabel(startLabel);
+
+    // evalúa condición
+    Visit(context.expr());
+    c.PopObject(Register.X0);
+    c.Cbz(Register.X0, endLabel);
+
+    // abre scope para variables locales **dentro** del cuerpo
+    c.NewScope();
+    // cuerpo del bucle
+    Visit(context.stmt());
+    // cierra scope y limpia sólo lo de adentro
+    var bytes = c.endScope();
+    if (bytes > 0)
+    {
+        c.Comment($"Removing {bytes} bytes from stack");
+        c.Mov(Register.X0, bytes);
+        c.Add(Register.SP, Register.SP, Register.X0);
+    }
+
+    // salto de vuelta al inicio
+    c.B(startLabel);
+
+    // etiqueta de fin
+    c.SetLabel(endLabel);
+
+    // restaura labels exteriores
+    continueLabel = prevContinue;
+    breakLabel    = prevBreak;
+
+    c.Comment("End of For Statement Condition");
+    return null;
+}
+
+
+// 2) For clásico (init; cond; incr)
+public override Object? VisitForStmt(LanguageParser.ForStmtContext context)
+{
+    c.Comment("Visiting Traditional For Statement");
+
+    var startLabel     = c.GetLabel();   // Inicio del ciclo
+    var endLabel       = c.GetLabel();   // Salida del ciclo
+    var incrementLabel = c.GetLabel();   // Incremento
+
+    // Guardar los labels actuales
+    var prevContinue = continueLabel;
+    var prevBreak    = breakLabel;
+    continueLabel = incrementLabel;
+    breakLabel    = endLabel;
+
+    // ⚠️ Las variables del init deben sobrevivir al cuerpo del for
+    c.Comment("For loop initialization");
+    Visit(context.forInit()); // ejemplo: j := 0
+
+    // Condición
+    c.SetLabel(startLabel);
+    Visit(context.expr(0));   // condición: j < 5
+    c.PopObject(Register.X0);
+    c.Cbz(Register.X0, endLabel);  // Si no se cumple, salta al final
+
+    // 💡 Nuevo scope para el cuerpo del for
+    c.NewScope();
+    c.Comment("For loop body");
+    Visit(context.stmt());    // bloque dentro del for
+
+    // Cierre del body
+    int bodyBytes = c.endScope();
+    if (bodyBytes > 0)
+    {
+        c.Comment($"Removing {bodyBytes} bytes from loop body");
+        c.Mov(Register.X0, bodyBytes);
+        c.Add(Register.SP, Register.SP, Register.X0);
+    }
+
+    // Incremento
+    c.SetLabel(incrementLabel);
+    Visit(context.expr(1));   // incremento: j = j + 1
+    // No hacer PopObject aquí, ya que puede no dejar nada válido
+
+    // Salto al inicio
+    c.B(startLabel);
+
+    // Etiqueta de fin
+    c.SetLabel(endLabel);
+    c.Comment("End of Traditional For Statement");
+
+    // Restaurar labels
+    continueLabel = prevContinue;
+    breakLabel    = prevBreak;
+
+    return null;
+}
+
+
+public override Object? VisitSwitchStmt(LanguageParser.SwitchStmtContext context)
+{
+    return null;
+}
+public override Object? VisitBreakStmt(LanguageParser.BreakStmtContext context)
+{
+
+    c.Comment("Break statement");
+    if (breakLabel != null)
+    {
+        c.B(breakLabel);
+    }
+
+    return null;
+}
+public override Object? VisitContinueStmt(LanguageParser.ContinueStmtContext context)
+{
+
+    c.Comment("Continue statement");
+    if (continueLabel != null)
+    {
+        c.B(continueLabel);
+    }
+
+    return null;
+}    
+
+public override object? VisitRelational(LanguageParser.RelationalContext ctx)
+{
+    // 1) evaluate both sides onto the stack
+    Visit(ctx.expr(0));
+    Visit(ctx.expr(1));
+
+    // 2) pop into registers
+    var rightIsFloat = c.TopObject().Type == StackObject.StackObjectType.Float;
+    var right = c.PopObject(rightIsFloat ? Register.D0 : Register.X0);
+    var leftIsFloat  = c.TopObject().Type == StackObject.StackObjectType.Float;
+    var left  = c.PopObject(leftIsFloat  ? Register.D1 : Register.X1);
+
+    // 3) do the appropriate compare
+    if (leftIsFloat || rightIsFloat)
+    {
+        if (!leftIsFloat)  c.Scvtf(Register.D1, Register.X1);
+        if (!rightIsFloat) c.Scvtf(Register.D0, Register.X0);
+        c.Fcmp(Register.D1, Register.D0);
+    }
+    else
+    {
+        c.Cmp(Register.X1, Register.X0);  // integer/rune compare
+    }
+
+    // 4) set up true/false labels
+    var trueLabel = c.GetLabel();
+    var endLabel  = c.GetLabel();
+
+    switch (ctx.op.Text)
+    {
+        case "<":  if (leftIsFloat||rightIsFloat) c.Blt(trueLabel); else c.Blt(trueLabel); break;
+        case "<=": if (leftIsFloat||rightIsFloat) c.Ble(trueLabel); else c.Ble(trueLabel); break;
+        case ">":  if (leftIsFloat||rightIsFloat) c.Bgt(trueLabel); else c.Bgt(trueLabel); break;
+        case ">=": if (leftIsFloat||rightIsFloat) c.Bge(trueLabel); else c.Bge(trueLabel); break;
+        default: throw new Exception($"Unsupported op {ctx.op.Text}");
+    }
+
+    // 5) false path
+    c.Mov(Register.X0, 0);
+    c.B(endLabel);
+
+    // 6) true path
+    c.SetLabel(trueLabel);
+    c.Mov(Register.X0, 1);
+
+    // 7) end
+    c.SetLabel(endLabel);
+    c.Push(Register.X0);
+    c.PushObject(c.BoolObject());
+
+    return null;
+}
+
+public override object? VisitReturnStmt(LanguageParser.ReturnStmtContext context)
+{
+    c.Comment("Return statement");
+    if (context.expr() != null)
+    {
+        Visit(context.expr());
+        c.PopObject(Register.X0);  // X0 = valor de retorno
+    }
+    // Salta a la etiqueta que fijamos en VisitFuncDcl
+    if (returnLabel != null)
+        c.B(returnLabel);
+    return null;
+}
+
+public override object? VisitArray(LanguageParser.ArrayContext ctx)
+{
+    string tipo  = ctx.Tipo().GetText();              // int | string
+    var    exprs = ctx.args()?.expr();
+    int    n     = exprs?.Length ?? 0;
+
+    if (tipo != "int" && tipo != "string")
+        throw new Exception("Solo se soportan slices de tipo int y string");
+
+    // 1) Reserva n*8 bytes en heap, X9 = base
+    c.Comment($"Reservar {n * 8} bytes para slice []{tipo}");
+    c.Mov(Register.X9, Register.HP);
+    c.Add(Register.HP, Register.HP, n * 8);
+
+    // 2) Copia cada elemento
+    long offset = 0;
+    foreach (var e in exprs ?? Array.Empty<LanguageParser.ExprContext>())
+    {
+        Visit(e);
+        var elemObj = c.PopObject(Register.X0);
+        if (tipo == "int" && elemObj.Type != StackObject.StackObjectType.Int)
+            throw new Exception("Elemento no es int");
+        if (tipo == "string" && elemObj.Type != StackObject.StackObjectType.String)
+            throw new Exception("Elemento no es string");
+        c.Str(Register.X0, Register.X9, (int)offset);
+        offset += 8;
+    }
+
+    // 3) Empuja puntero y objeto slice
+    var sliceObj = c.PointerObject();
+    sliceObj.Length = n;
+    sliceObj.Id     = "_slice_tmp_" + Guid.NewGuid().ToString("N");
+    sliceObj.Value  = Register.X9;
+
+    c.Mov(Register.X0, Register.X9);
+    c.Push(Register.X0);
+    c.PushObject(sliceObj);
+    return sliceObj;
+}
+
+
+
+public override object? VisitCallee(LanguageParser.CalleeContext ctx)
+{
+    /* ───────── slice[index] • lectura ───────── */
+    if (ctx.call().Length == 1 &&
+        ctx.call(0) is LanguageParser.ArrayAccessContext arrCtx)
+    {
+        /* Slice -> Ptr + Obj */
+        Visit(ctx.expr());
+
+        /* Índice -> Int + Obj */
+        Visit(arrCtx.expr());
+
+        var idxObj   = c.PopObject(Register.X1);  // X1 = índice
+        var sliceObj = c.PopObject(Register.X0);  // X0 = base ptr
+
+        if (idxObj.Type  != StackObject.StackObjectType.Int ||
+            sliceObj.Type != StackObject.StackObjectType.Pointer)
+            throw new Exception("indexing inválido");
+
+        /* X1 = X1 * 8  */
+        c.Mov(Register.X2, 8);
+        c.Mul(Register.X1, Register.X1, Register.X2);
+
+        /* X0 = base + idx*8 */
+        c.Add(Register.X0, Register.X0, Register.X1);
+
+        /* LDR elemento → X3  */
+        c.Ldr(Register.X3, Register.X0);
+        c.Push(Register.X3);
+        c.PushObject(c.IntObject());
+
+        return null;
+    }
+
+    /* ─── llamada normal a función (fmt.Println, etc.) ─── */
+    var funcName = ctx.expr().GetText();
+    c.Comment($"--- Llamada a función {funcName} ---");
+    c.Bl($"func_{funcName}");
+    c.Push(Register.X0);
+    c.PushObject(c.IntObject());
+    return null;
+}
+
+
+public object? VisitCall(LanguageParser.ArgsContext argsContext, string funcName)
+{
+    c.Comment($"Llamando a función: {funcName}");
+
+    if (argsContext != null)
+    {
+        foreach (var expr in argsContext.expr())
+        {
+            Visit(expr); // Genera los argumentos en orden (se apilan)
+        }
+    }
+
+    c.Bl($"func_{funcName}"); // Llamada a la función (etiqueta generada en VisitFuncDcl)
+
+    c.Push(Register.X0); // Se espera que el retorno esté en x0
+    c.PushObject(c.IntObject()); // Aquí asumimos que es entero. Puedes ajustar según el retorno.
+
+    return null;
+}
+
+
+public override object? VisitIndexSlice(LanguageParser.IndexSliceContext ctx)
+{
+    string sliceName = ctx.ID().GetText();
+
+    /* 1. valor a buscar */
+    Visit(ctx.expr());
+    var valObj = c.PopObject(Register.X0);      // ◆  X0 = valor buscado
+
+    if (valObj.Type != StackObject.StackObjectType.Int)
+        throw new Exception("slices.Index solo soporta enteros");
+
+    /* 2. puntero base y longitud */
+    var (offset, sliceObj) = c.GetObject(sliceName);
+    if (sliceObj.Type != StackObject.StackObjectType.Pointer)
+        throw new Exception($"{sliceName} no es slice");
+
+    c.Ldr(Register.X1, Register.SP, offset);    // X1 = base ptr
+    c.Mov(Register.X2, sliceObj.Length);        // X2 = len
+
+    /* índices para el bucle */
+    c.Mov(Register.X3, 0);    // idx
+    c.Mov(Register.X4, Register.X1); // curPtr
+
+    var loop  = c.GetLabel();
+    var found = c.GetLabel();
+    var fail  = c.GetLabel();
+    var fin   = c.GetLabel();
+
+    c.SetLabel(loop);
+    c.Cmp(Register.X3, Register.X2);   // idx < len ?
+    c.Bge(fail);
+
+    c.Ldr(Register.X5, Register.X4);   // X5 = elemento
+    c.Cmp(Register.X5, Register.X0);   // ◆ comparar con valor en X0
+    c.Beq(found);
+
+    c.Add(Register.X4, Register.X4, 8); // curPtr += 8
+    c.Add(Register.X3, Register.X3, 1); // idx++
+    c.B(loop);
+
+    c.SetLabel(found);
+    c.Mov(Register.X0, Register.X3);
+    c.B(fin);
+
+    c.SetLabel(fail);
+    c.Mov(Register.X0, -1);
+
+    c.SetLabel(fin);
+    c.Push(Register.X0);
+    c.PushObject(c.IntObject());
+    return null;
+}
+
+public override object? VisitJoin(LanguageParser.JoinContext ctx)
+{
+    // strings.Join(ID, sepExpr)
+    string sliceName = ctx.ID().GetText();
+
+    /* 1. Evaluar separador -> puntero en X6 */
+    Visit(ctx.expr());
+    var sepObj = c.PopObject(Register.X6);
+    if (sepObj.Type != StackObject.StackObjectType.String)
+        throw new Exception("El separador de strings.Join debe ser string");
+
+    /* 2. Obtener slice []string */
+    var (offset, sliceObj) = c.GetObject(sliceName);
+    if (sliceObj.Type != StackObject.StackObjectType.Pointer)
+        throw new Exception($"{sliceName} no es slice");
+
+    int len = sliceObj.Length;
+    if (len == 0)
+    {
+        // cadena vacía
+        var emptyObj = c.StringObject();
+        c.Push(Register.HP);     // HP apunta a terminador
+        c.PushObject(emptyObj);
+        return null;
+    }
+
+    /* 3. Crear string destino (objeto inicializado)           */
+    var resultObj = c.StringObject();         // deja ptr en HP y el objeto encima
+    c.PopObject(Register.X1);                 // X1  = objeto (lo desechamos)
+    c.Pop(Register.X1);                       // X1  = ptr inicio destino
+    c.Mov(Register.X2, Register.X1);          // X2  = cursor destino
+
+    /* Puntero base del slice */
+    c.Ldr(Register.X0, Register.SP, offset);  // X0  = base slice
+
+    /* 4. Copiar palabras y separadores                        */
+    for (int i = 0; i < len; i++)
+    {
+        // ---- palabra i ----
+        c.Ldr(Register.X3, Register.X0, i * 8);      // X3 = ptr palabra
+        var loopStr = c.GetLabel();
+        c.SetLabel(loopStr);
+        c.Ldrb("w4", Register.X3);
+        c.Strb("w4", Register.X2);
+        c.Add(Register.X3, Register.X3, 1);
+        c.Add(Register.X2, Register.X2, 1);
+        c.Cmp("w4", 0);
+        c.Bne(loopStr);
+
+        // ---- separador (si no es la última) ----
+        if (i < len - 1)
+        {
+            var loopSep = c.GetLabel();
+            c.Mov(Register.X5, Register.X6);         // X5 = ptr sep
+            c.SetLabel(loopSep);
+            c.Ldrb("w4", Register.X5);
+            c.Strb("w4", Register.X2);
+            c.Add(Register.X5, Register.X5, 1);
+            c.Add(Register.X2, Register.X2, 1);
+            c.Cmp("w4", 0);
+            c.Bne(loopSep);
+        }
+    }
+
+    /* 5. Actualizar HP al nuevo cursor                         */
+    c.Mov(Register.HP, Register.X2);
+
+    /* 6. Dejar en la pila: ptr resultado + objeto‑string listo */
+    c.Push(Register.X1);                 // ptr resultado
+    c.PushObject(resultObj);             // objeto creado por StringObject
+    return null;
+}
+
+public override Object? VisitAppend(LanguageParser.AppendContext context)
+{
+    return null;
+}
+public override Object? VisitLen(LanguageParser.LenContext context)
+{
+    return null;
+}
+
+public override object? VisitLogicalAnd(LanguageParser.LogicalAndContext context)
+{
+    c.Comment("Logical AND");
+
+    // Evaluar operando izquierdo
+    Visit(context.expr(0));
+    c.Pop("X0");
+    var leftObj = c.TopObject();
+    c.PopObject("X0");
+
+    if (leftObj.Type != StackObject.StackObjectType.Bool)
+        throw new Exception("El operando izquierdo de && no es booleano");
+
+    var falseLabel = c.GetLabel();
+    var endLabel = c.GetLabel();
+
+    // Si es false, cortar y devolver false
+    c.Cbz("X0", falseLabel);
+
+    // Evaluar operando derecho
+    Visit(context.expr(1));
+    c.Pop("X0");
+    var rightObj = c.TopObject();
+    c.PopObject("X0");
+
+    if (rightObj.Type != StackObject.StackObjectType.Bool)
+        throw new Exception("El operando derecho de && no es booleano");
+
+    c.Cbz("X0", falseLabel);
+
+    // Ambos true → true
+    c.Mov("X0", 1);
+    c.B(endLabel);
+
+    // Etiqueta false → false
+    c.SetLabel(falseLabel);
+    c.Mov("X0", 0);
+
+    // End
+    c.SetLabel(endLabel);
+    c.Push("X0");
+    c.PushObject(c.BoolObject());
+
+    return null;
+}
+
+
+public override object? VisitEquality(LanguageParser.EqualityContext context)
+{
+    c.Comment("Equality");
+
+    Visit(context.expr(0));
+    c.Pop("X0"); var leftObj = c.TopObject(); c.PopObject("X0");
+    Visit(context.expr(1));
+    c.Pop("X1"); var rightObj = c.TopObject(); c.PopObject("X1");
+
+    if (leftObj.Type != rightObj.Type) throw new Exception("Los operandos de == deben ser del mismo tipo");
+
+    var trueLabel = c.GetLabel();
+    var endLabel = c.GetLabel();
+    c.Cmp("X0", "X1");
+    if (context.op.Text == "==") c.Beq(trueLabel); else c.Bne(trueLabel);
+
+    c.Mov("X0", 0);
+    c.B(endLabel);
+
+    c.SetLabel(trueLabel);
+    c.Mov("X0", 1);
+    c.SetLabel(endLabel);
+
+    c.Push("X0");
+    c.PushObject(c.BoolObject());
+    return null;
+}
+
+
+
+
+
+public override Object? VisitLogicalOr(LanguageParser.LogicalOrContext context)
+{
+    Visit(context.expr(0));
+    var left = c.PopObject("X0");
+
+    Visit(context.expr(1));
+    var right = c.PopObject("X1");
+
+    if (left.Type != StackObject.StackObjectType.Bool || right.Type != StackObject.StackObjectType.Bool)
+        throw new Exception("Los operandos del operador lógico || deben ser booleanos");
+
+    bool l = Convert.ToInt32(left.Value) != 0;
+    bool r = Convert.ToInt32(right.Value) != 0;
+    bool result = l || r;
+
+    c.Mov("X0", result ? 1 : 0);
+    c.Push("X0");
+    c.PushObject(c.BoolObject());
+
+    return null;
+}
+
+
+public override Object? VisitClassDcl(LanguageParser.ClassDclContext context)
+{
+    return null;
+}
+public override Object? VisitNew(LanguageParser.NewContext context)
+{
+    return null;
+}
+
+}

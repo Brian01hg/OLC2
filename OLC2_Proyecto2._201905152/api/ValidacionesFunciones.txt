@@ -1,0 +1,28 @@
+// 1. Funciones no recursivas sin parámetros (5 punto)
+//ESTA A MEDIAS(SOLO FUNCIONA EL SALUDAR)
+func saludar() {
+	fmt.Println("¡Hola, mundo!")
+}
+
+// Función sin parámetros que retorna un valor
+func obtenerNumero() int {
+	return 42
+}
+
+func main() {
+	puntos := 0
+
+	fmt.Println("=== Archivo de prueba de funciones ===")
+
+	// 1. Funciones no recursivas sin parámetros (5 punto)
+	fmt.Println("==== Funciones no recursivas sin parámetros ====")
+	puntosFuncionesSimples := 0
+
+	fmt.Println("Función sin retorno:")
+	fmt.Println("\n\n###Validacion Manual")
+	saludar()
+
+	fmt.Println("\nFunción con retorno:")
+	numero := obtenerNumero()
+	fmt.Println("El número obtenido es:", numero)
+}
